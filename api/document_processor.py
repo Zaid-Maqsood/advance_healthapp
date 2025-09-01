@@ -183,6 +183,7 @@ class DocumentProcessor:
     
     def search_user_documents(self, user_id: str, query: str, top_k: int = 5) -> List[Dict]:
         """Search user's documents for relevant information"""
+        """full code"""
         
         try:
             # Generate query embedding

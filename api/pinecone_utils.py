@@ -30,7 +30,8 @@ class PineconeManager:
         """Create Pinecone index for OpenAI embeddings if it doesn't exist"""
         try:
             # Check if index exists
-            if not self.pc.has_index(self.index_name):
+            existing_indexes = [index.name for index in self.pc.list_indexes()]
+            if self.index_name not in existing_indexes:
                 # Create index for OpenAI embeddings (ada-002, 1536 dims)
                 self.pc.create_index(
                     name=self.index_name,

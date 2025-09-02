@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from decouple import config
+from openai import OpenAI
 from .firebase_auth import require_auth
 from .document_processor import DocumentProcessor
 from .models import UserDocument, UserChatSession, ChatMessage
@@ -95,11 +96,13 @@ class EnhancedChatView(APIView):
             
             # Generate AI response with RAG if applicable
             if user_message and not image_file:
-                # Text query - use RAG if user has documents
-                response = self._generate_rag_response(user_id, user_message, session)
+                # Text query - use hybrid search for RAG
+                response = self._generate_hybrid_rag_response(user_id, user_message, session)
+            elif image_file and user_message:
+                # Image + text query - use hybrid search for medical context
+                response = self._generate_image_text_hybrid_response(user_id, user_message, image_base64, session)
             elif image_file:
-                # Image query - use medical context for safety advice
-                # 1. Get medical context for user
+                # Image-only query - use all medical data (current approach)
                 medical_chunks = self.document_processor.search_user_documents(
                     user_id=user_id,
                     query="food safety",  # Use a generic query to get relevant medical info
@@ -123,7 +126,8 @@ class EnhancedChatView(APIView):
 
                 # 4. Get AI response
                 try:
-                    ai_response = openai.ChatCompletion.create(
+                    client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                    ai_response = client.chat.completions.create(
                         model="gpt-4o",
                         messages=[
                             {"role": "system", "content": "You are a helpful medical nutritionist. Use the user's medical context to analyze food images and provide safety advice."},
@@ -171,8 +175,144 @@ class EnhancedChatView(APIView):
         else:
             return 'other'
     
+    def _generate_hybrid_rag_response(self, user_id: str, query: str, session: UserChatSession) -> str:
+        """Generate response using hybrid search RAG (BM25 + Semantic)"""
+        try:
+            # Use hybrid search with intelligent weight adjustment
+            search_results = self.document_processor._hybrid_search(
+                user_id=user_id,
+                query=query,
+                top_k=3
+                # Weights are automatically determined by query analysis
+            )
+            
+            if search_results:
+                # Build context from retrieved documents
+                context = self._build_context_from_results(search_results)
+                
+                # Generate response with context
+                prompt = f"""Based on the user's medical documents, answer the following question:
+
+Question: {query}
+
+Relevant information from documents:
+{context}
+
+Please provide a comprehensive answer based on the information from the user's documents. If the documents don't contain enough information to answer the question, say so clearly."""
+                
+                client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                response = client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": "You are a helpful medical assistant. Use the provided document context to answer questions accurately."},
+                        {"role": "user", "content": prompt}
+                    ]
+                )
+                
+                return response.choices[0].message["content"]
+            else:
+                # Fallback: Try semantic search only if hybrid search failed
+                logger.info("Hybrid search returned no results, trying semantic search fallback")
+                fallback_results = self.document_processor.search_user_documents(
+                    user_id=user_id,
+                    query=query,
+                    top_k=3
+                )
+                
+                if fallback_results:
+                    context = self._build_context_from_results(fallback_results)
+                    prompt = f"""Based on the user's medical documents, answer the following question:
+
+Question: {query}
+
+Relevant information from documents:
+{context}
+
+Please provide a comprehensive answer based on the information from the user's documents. If the documents don't contain enough information to answer the question, say so clearly."""
+                    
+                    client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful medical assistant. Use the provided document context to answer questions accurately."},
+                            {"role": "user", "content": prompt}
+                        ]
+                    )
+                    
+                    return response.choices[0].message["content"]
+                else:
+                    # No relevant documents found - provide general response
+                    client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                    response = client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": "You are a helpful medical assistant."},
+                            {"role": "user", "content": query}
+                        ]
+                    )
+                    
+                    return response.choices[0].message["content"]
+                
+        except Exception as e:
+            logger.error(f"Error generating hybrid RAG response: {str(e)}")
+            return f"I apologize, but I encountered an error while processing your request: {str(e)}"
+    
+    def _generate_image_text_hybrid_response(self, user_id: str, query: str, image_base64: str, session: UserChatSession) -> str:
+        """Generate response for image + text using hybrid search for medical context"""
+        try:
+            # Use hybrid search with intelligent weight adjustment for medical context
+            medical_chunks = self.document_processor._hybrid_search(
+                user_id=user_id,
+                query=query,
+                top_k=5
+                # Weights are automatically determined by query analysis
+            )
+            
+            # Fallback if no medical data found
+            if not medical_chunks:
+                logger.info("Hybrid search returned no results, trying semantic search fallback")
+                medical_chunks = self.document_processor.search_user_documents(
+                    user_id=user_id,
+                    query=query,
+                    top_k=5
+                )
+            
+            medical_context = self._build_context_from_results(medical_chunks)
+
+            # Build prompt for OpenAI
+            prompt = f"""
+            The user has the following medical context:
+            {medical_context}
+
+            User's question: {query}
+
+            Analyze the uploaded image and answer the user's question based on their medical context. Provide relevant health advice considering their medical history.
+            """
+
+            # Prepare user content for OpenAI
+            image_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_base64}}
+            ]
+
+            # Get AI response
+            client = OpenAI(api_key=config('OPENAI_API_KEY'))
+            ai_response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": "You are a helpful medical nutritionist. Use the user's medical context to analyze images and provide personalized health advice."},
+                    {"role": "user", "content": image_content}
+                ]
+            )
+            
+            return ai_response.choices[0].message["content"]
+            
+        except Exception as e:
+            logger.error(f"Error generating image+text hybrid response: {str(e)}")
+            return f"I apologize, but I encountered an error while analyzing the image and processing your question: {str(e)}"
+    
     def _generate_rag_response(self, user_id: str, query: str, session: UserChatSession) -> str:
-        """Generate response using RAG (Retrieval-Augmented Generation)"""
+        """Generate response using RAG (Retrieval-Augmented Generation) - Legacy method"""
         try:
             # Search user's documents
             search_results = self.document_processor.search_user_documents(
@@ -195,7 +335,8 @@ Relevant information from documents:
 
 Please provide a comprehensive answer based on the information from the user's documents. If the documents don't contain enough information to answer the question, say so clearly."""
                 
-                response = openai.ChatCompletion.create(
+                client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                response = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
                         {"role": "system", "content": "You are a helpful medical assistant. Use the provided document context to answer questions accurately."},
@@ -206,7 +347,8 @@ Please provide a comprehensive answer based on the information from the user's d
                 return response.choices[0].message["content"]
             else:
                 # No relevant documents found - provide general response
-                response = openai.ChatCompletion.create(
+                client = OpenAI(api_key=config('OPENAI_API_KEY'))
+                response = client.chat.completions.create(
                     model="gpt-4o",
                     messages=[
                         {"role": "system", "content": "You are a helpful medical assistant."},
@@ -236,7 +378,8 @@ Please provide a comprehensive answer based on the information from the user's d
     def _generate_image_response(self, user_content: list, session: UserChatSession) -> str:
         """Generate response for image analysis (without medical context)"""
         try:
-            response = openai.ChatCompletion.create(
+            client = OpenAI(api_key=config('OPENAI_API_KEY'))
+            response = client.chat.completions.create(
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are a helpful medical nutritionist. Analyze food images and provide detailed nutritional information."},

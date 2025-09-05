@@ -967,7 +967,54 @@ class DocumentProcessor:
         return chunks
     
     def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Generate embeddings for text chunks using OpenAI"""
+        """Generate embeddings for text chunks using OpenAI's faster model with batch processing"""
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=config('OPENAI_API_KEY'))
+            
+            # Check if we need to split into batches (OpenAI has limits)
+            max_batch_size = 100  # OpenAI's limit for text-embedding-3-small
+            
+            if len(texts) <= max_batch_size:
+                # Single batch processing
+                response = client.embeddings.create(
+                    input=texts,
+                    model="text-embedding-3-small"  # Faster, smaller model
+                )
+                embeddings = [data.embedding for data in response.data]
+            else:
+                # Process in multiple batches
+                embeddings = self._generate_embeddings_large_batch(texts, client)
+            
+            logger.info(f"Generated {len(embeddings)} embeddings using text-embedding-3-small")
+            return embeddings
+            
+        except Exception as e:
+            logger.error(f"Error generating embeddings: {str(e)}")
+            # Fallback to individual calls if batch fails
+            return self._generate_embeddings_fallback(texts)
+    
+    def _generate_embeddings_large_batch(self, texts: List[str], client) -> List[List[float]]:
+        """Handle large batches by splitting into smaller chunks"""
+        max_batch_size = 100
+        all_embeddings = []
+        
+        for i in range(0, len(texts), max_batch_size):
+            batch = texts[i:i + max_batch_size]
+            logger.info(f"Processing batch {i//max_batch_size + 1} with {len(batch)} texts")
+            
+            response = client.embeddings.create(
+                input=batch,
+                model="text-embedding-3-small"
+            )
+            
+            batch_embeddings = [data.embedding for data in response.data]
+            all_embeddings.extend(batch_embeddings)
+        
+        return all_embeddings
+    
+    def _generate_embeddings_fallback(self, texts: List[str]) -> List[List[float]]:
+        """Fallback method for generating embeddings one by one"""
         embeddings = []
         
         for text in texts:
@@ -977,12 +1024,12 @@ class DocumentProcessor:
                 
                 response = client.embeddings.create(
                     input=text,
-                    model="text-embedding-ada-002"
+                    model="text-embedding-3-small"  # Still use the faster model
                 )
                 embedding = response.data[0].embedding
                 embeddings.append(embedding)
             except Exception as e:
-                logger.error(f"Error generating embedding: {str(e)}")
+                logger.error(f"Error generating embedding for text: {str(e)}")
                 raise
         
         return embeddings
@@ -991,7 +1038,7 @@ class DocumentProcessor:
                              chunks: List[str], embeddings: List[List[float]], 
                              document_type: str = 'other', hybrid_chunks: List[Dict[str, Any]] = None) -> UserDocument:
         """Store document chunks in Pinecone and create database records with enhanced metadata"""
-        
+        document = UserDocument.objects.get(id=document.id)    
         # Create document record
         document = UserDocument.objects.create(
             user_id=user_id,

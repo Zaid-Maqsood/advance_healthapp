@@ -134,7 +134,7 @@ class EnhancedChatView(APIView):
                             {"role": "user", "content": image_content}
                         ]
                     )
-                    response = ai_response.choices[0].message["content"]
+                    response = ai_response.choices[0].message.content
                 except Exception as e:
                     logger.error(f"Error generating image+medical response: {str(e)}")
                     response = f"I apologize, but I encountered an error while analyzing the image: {str(e)}"
@@ -198,7 +198,7 @@ Question: {query}
 Relevant information from documents:
 {context}
 
-Please provide a comprehensive answer based on the information from the user's documents. If the documents don't contain enough information to answer the question, say so clearly."""
+You are an amazing nutritionist. Reply naturally and appropriately to greetings and general queries like hi, how are you, etc and do not use medical reports for replying these. Please provide a comprehensive answer based on the information from the user's documents. If the documents don't contain enough information to answer the question, say so clearly."""
                 
                 client = OpenAI(api_key=config('OPENAI_API_KEY'))
                 response = client.chat.completions.create(
@@ -209,7 +209,7 @@ Please provide a comprehensive answer based on the information from the user's d
                     ]
                 )
                 
-                return response.choices[0].message["content"]
+                return response.choices[0].message.content
             else:
                 # Fallback: Try semantic search only if hybrid search failed
                 logger.info("Hybrid search returned no results, trying semantic search fallback")
@@ -239,7 +239,7 @@ Please provide a comprehensive answer based on the information from the user's d
                         ]
                     )
                     
-                    return response.choices[0].message["content"]
+                    return response.choices[0].message.content
                 else:
                     # No relevant documents found - provide general response
                     client = OpenAI(api_key=config('OPENAI_API_KEY'))
@@ -251,7 +251,7 @@ Please provide a comprehensive answer based on the information from the user's d
                         ]
                     )
                     
-                    return response.choices[0].message["content"]
+                    return response.choices[0].message.content
                 
         except Exception as e:
             logger.error(f"Error generating hybrid RAG response: {str(e)}")
@@ -305,7 +305,7 @@ Please provide a comprehensive answer based on the information from the user's d
                 ]
             )
             
-            return ai_response.choices[0].message["content"]
+            return ai_response.choices[0].message.content
             
         except Exception as e:
             logger.error(f"Error generating image+text hybrid response: {str(e)}")
@@ -344,7 +344,7 @@ Please provide a comprehensive answer based on the information from the user's d
                     ]
                 )
                 
-                return response.choices[0].message["content"]
+                return response.choices[0].message.content
             else:
                 # No relevant documents found - provide general response
                 client = OpenAI(api_key=config('OPENAI_API_KEY'))
@@ -356,7 +356,7 @@ Please provide a comprehensive answer based on the information from the user's d
                     ]
                 )
                 
-                return response.choices[0].message["content"]
+                return response.choices[0].message.content
                 
         except Exception as e:
             logger.error(f"Error generating RAG response: {str(e)}")
@@ -387,7 +387,7 @@ Please provide a comprehensive answer based on the information from the user's d
                 ]
             )
             
-            return response.choices[0].message["content"]
+            return response.choices[0].message.content
             
         except Exception as e:
             logger.error(f"Error generating image response: {str(e)}")

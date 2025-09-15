@@ -10,7 +10,9 @@ from openai import OpenAI
 from .firebase_auth import require_auth
 from .document_processor import DocumentProcessor
 from .models import UserDocument, UserChatSession, ChatMessage
+from .dailymed_tool import MedicationQueryTool
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +25,12 @@ class EnhancedChatView(APIView):
     def __init__(self):
         super().__init__()
         self.document_processor = DocumentProcessor()
+        
+        # Initialize DailyMed tool
+        self.dailymed_tool = MedicationQueryTool()
     
     @require_auth
-    def post(self, request):
+    async def post(self, request):
         """Handle chat requests with authentication and RAG"""
         try:
             user_id = request.user_id
@@ -96,8 +101,13 @@ class EnhancedChatView(APIView):
             
             # Generate AI response with RAG if applicable
             if user_message and not image_file:
-                # Text query - use hybrid search for RAG
-                response = self._generate_hybrid_rag_response(user_id, user_message, session)
+                # Check if query is medication-related
+                if self._is_medication_query(user_message):
+                    # Use DailyMed for medication queries
+                    response = await self._handle_medication_query(user_message)
+                else:
+                    # Text query - use hybrid search for RAG
+                    response = self._generate_hybrid_rag_response(user_id, user_message, session)
             elif image_file and user_message:
                 # Image + text query - use hybrid search for medical context
                 response = self._generate_image_text_hybrid_response(user_id, user_message, image_base64, session)
@@ -160,6 +170,96 @@ class EnhancedChatView(APIView):
                 'error': f'Chat error: {str(e)}'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
+    def _is_medication_query(self, query: str) -> bool:
+        """Check if query is medication-related"""
+        medication_keywords = [
+            'medication', 'medicine', 'drug', 'pill', 'tablet', 'capsule',
+            'dosage', 'side effects', 'interactions', 'contraindications',
+            'warnings', 'adverse reactions', 'active ingredients',
+            'metformin', 'lisinopril', 'aspirin', 'ibuprofen', 'acetaminophen',
+            'warfarin', 'insulin', 'atorvastatin', 'amlodipine', 'omeprazole',
+            'prednisone', 'hydrochlorothiazide', 'furosemide', 'digoxin',
+            'morphine', 'oxycodone', 'tramadol', 'diazepam', 'lorazepam',
+            'sertraline', 'fluoxetine', 'amitriptyline', 'gabapentin',
+            'pregabalin', 'levothyroxine', 'synthroid'
+        ]
+        
+        query_lower = query.lower()
+        return any(keyword in query_lower for keyword in medication_keywords)
+    
+    async def _extract_medication_name(self, query: str) -> str:
+        """Extract medication name from user query"""
+        try:
+            # Common medication patterns
+            medication_patterns = [
+                r'(?:tell me about|what is|information about|side effects of|dosage of|warnings for)\s+([a-zA-Z\s]+?)(?:\?|$|\.|,)',
+                r'(?:metformin|lisinopril|aspirin|ibuprofen|acetaminophen|warfarin|insulin|atorvastatin|amlodipine|omeprazole|prednisone|hydrochlorothiazide|furosemide|digoxin|morphine|oxycodone|tramadol|diazepam|lorazepam|sertraline|fluoxetine|amitriptyline|gabapentin|pregabalin|levothyroxine|synthroid)',
+                r'(?:medication|medicine|drug|pill|tablet|capsule|injection|dose|dosage)\s+(?:called\s+)?([a-zA-Z\s]+?)(?:\?|$|\.|,)',
+            ]
+            
+            query_lower = query.lower()
+            
+            # Check for specific medication names first
+            for pattern in medication_patterns:
+                matches = re.findall(pattern, query_lower, re.IGNORECASE)
+                if matches:
+                    medication = matches[0].strip()
+                    # Clean up the medication name
+                    medication = re.sub(r'\s+', ' ', medication)
+                    medication = medication.strip('?.,!')
+                    if len(medication) > 2:  # Avoid very short matches
+                        return medication
+            
+            # If no specific pattern matches, try to extract from context
+            medication_keywords = [
+                'medication', 'medicine', 'drug', 'pill', 'tablet', 'capsule',
+                'side effects', 'dosage', 'warnings', 'contraindications'
+            ]
+            
+            if any(keyword in query_lower for keyword in medication_keywords):
+                # Try to extract the word after common medication-related words
+                for keyword in medication_keywords:
+                    pattern = rf'{keyword}\s+(?:of\s+)?([a-zA-Z\s]+?)(?:\?|$|\.|,)'
+                    matches = re.findall(pattern, query_lower)
+                    if matches:
+                        medication = matches[0].strip()
+                        medication = re.sub(r'\s+', ' ', medication)
+                        medication = medication.strip('?.,!')
+                        if len(medication) > 2:
+                            return medication
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting medication name: {str(e)}")
+            return None
+    
+    async def _handle_medication_query(self, query: str) -> str:
+        """Handle medication-related queries using DailyMed database"""
+        try:
+            # Extract medication name from query
+            medication_name = await self._extract_medication_name(query)
+            
+            if not medication_name:
+                return "I couldn't identify a specific medication in your query. Please specify the medication name you'd like to know about."
+            
+            # Query DailyMed database
+            dailymed_result = await self.dailymed_tool.query_medication(
+                drug_name=medication_name,
+                query_type="details"
+            )
+            
+            # Format response with proper disclaimers
+            response = self.dailymed_tool.format_medication_response(
+                dailymed_result, query
+            )
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Error handling medication query: {str(e)}")
+            return f"I apologize, but I encountered an error while looking up medication information. Please try again or consult your doctor for medication-related questions."
+
     def _determine_document_type(self, filename: str) -> str:
         """Determine document type based on filename"""
         filename_lower = filename.lower()
@@ -505,7 +605,7 @@ class ChatHistoryView(APIView):
                     'type': message.message_type,
                     'content': message.content,
                     'timestamp': message.timestamp.isoformat(),
-                    'metadata': message.metadata
+                    'metadata': message.metadata   
                 })
             
             return Response({
